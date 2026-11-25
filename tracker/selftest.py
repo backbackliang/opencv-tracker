@@ -16,7 +16,7 @@ from typing import List
 import numpy as np
 
 from .core import TrackStatus, TargetTracker
-from .synthetic import SyntheticScene
+from .synthetic import FadeRectScene, SyntheticScene
 
 
 def _run_track(tracker: TargetTracker, scene: SyntheticScene, frames: int):
@@ -81,6 +81,26 @@ def run_selftest() -> int:
     reinit_ok = reinit_ok and result.status in (TrackStatus.TRACKING, TrackStatus.LOW_CONF)
     print(f"[重选] 重新框选并恢复追踪: {'OK' if reinit_ok else 'FAIL'}")
 
+    # ---- 场景 C:白色矩形渐隐 → 只剩移动水波纹,运动方向追踪 ----
+    print("\n[场景C] 白色矩形旋转 → 渐隐融入水纹背景 → 近乎不可见随机移动")
+    tracker_c = TargetTracker(snap=True, motion=True)
+    scene_c = FadeRectScene(seed=3)
+    frame, bbox = scene_c.step()
+    tracker_c.init(frame, bbox)
+    fade_errs, lost_c = [], 0
+    for _ in range(200):
+        frame, gt = scene_c.step()
+        result = tracker_c.update(frame)
+        if result.status == TrackStatus.LOST:
+            lost_c += 1
+        gx, gy = gt[0] + gt[2] / 2, gt[1] + gt[3] / 2
+        if result.center is not None and not scene_c.visible:
+            fade_errs.append(
+                ((result.center[0] - gx) ** 2 + (result.center[1] - gy) ** 2) ** 0.5
+            )
+    mean_c = float(np.mean(fade_errs)) if fade_errs else float("inf")
+    print(f"[统计] 不可见阶段平均中心误差={mean_c:.1f}px  LOST帧={lost_c}/200")
+
     checks = [
         ("使用 CSRT 追踪器", tracker.tracker_name == "CSRT"),
         ("[A] 有效定位率 >= 90%", rate >= 0.90),
@@ -88,6 +108,8 @@ def run_selftest() -> int:
         ("[A] 目标可见时无误判丢失", lost_frames <= 3),
         ("[B] 目标消失后能判定 LOST", statuses_b["LOST"] > 0 and lost_at is not None and lost_at <= 25),
         ("[B] 重新框选可恢复追踪", reinit_ok),
+        ("[C] 渐隐目标不丢失", lost_c == 0),
+        ("[C] 不可见阶段平均误差 < 15px", mean_c < 15.0),
     ]
     print()
     all_ok = True

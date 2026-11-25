@@ -22,7 +22,7 @@ from tracker.core import (  # noqa: E402
     _sanitize_bbox,
     create_tracker,
 )
-from tracker.synthetic import SyntheticScene  # noqa: E402
+from tracker.synthetic import FadeRectScene, SyntheticScene  # noqa: E402
 
 
 # ------------------------------------------------------------------ 基础功能
@@ -92,6 +92,35 @@ def test_tracks_morphing_transparent_target():
     print(f"    平均中心误差 {mean_err:.1f}px,丢失帧 {lost_frames}/{n_frames}")
     assert lost_frames <= 3, "目标并未消失,不应频繁判定丢失"
     assert mean_err < 25.0, f"平均中心误差过大: {mean_err:.1f}px"
+
+
+def test_motion_tracks_fading_rect():
+    """白色矩形渐隐场景:外观融入背景后,靠运动方向持续追踪。
+
+    这是外观方法的极限场景:目标 alpha 降到 0.05~0.20 后,颜色/模板
+    全部失效,唯一线索是随目标移动的水波纹光晕。要求:全程不判 LOST,
+    且不可见阶段的中心误差保持在低水平。
+    """
+    scene = FadeRectScene(seed=3)
+    frame, bbox = scene.step()
+    tracker = TargetTracker(snap=True, motion=True)
+    assert tracker.init(frame, bbox)
+
+    fade_errs, lost_frames = [], 0
+    for _ in range(200):
+        frame, gt = scene.step()
+        result = tracker.update(frame)
+        if result.status == TrackStatus.LOST:
+            lost_frames += 1
+        gx, gy = gt[0] + gt[2] / 2, gt[1] + gt[3] / 2
+        if result.center is not None and not scene.visible:
+            fade_errs.append(((result.center[0] - gx) ** 2 + (result.center[1] - gy) ** 2) ** 0.5)
+
+    mean_err = sum(fade_errs) / len(fade_errs)
+    print(f"    渐隐后 mean={mean_err:.1f}px p90={sorted(fade_errs)[int(0.9*len(fade_errs))]:.1f}px "
+          f"lost={lost_frames}/200")
+    assert lost_frames == 0, "渐隐目标不应被判丢失"
+    assert mean_err < 15.0, f"不可见阶段平均误差过大: {mean_err:.1f}px"
 
 
 def test_lost_detection_and_reinit():

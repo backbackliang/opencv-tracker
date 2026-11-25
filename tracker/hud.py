@@ -53,8 +53,8 @@ def draw_target(frame, result: TrackResult, tracker_name: str = "") -> None:
                 label_y = y + h + 18
             conf = result.confidence
             label = f"({result.center[0]},{result.center[1]}) conf={conf:.2f} {status.value}"
-            if result.note == "snap":
-                label += " [snap]"
+            if result.note:
+                label += f" [{result.note}]"
             _text(frame, label, (x, label_y), 0.5, color, 1)
 
     if status == TrackStatus.LOST:

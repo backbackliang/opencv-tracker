@@ -38,6 +38,8 @@ from typing import Optional, Tuple
 import cv2
 import numpy as np
 
+from .motion import MotionTracker
+
 BBox = Tuple[int, int, int, int]
 
 # 不同 OpenCV 版本/构建中 CSRT/KCF 的注册位置不同,逐个尝试。
@@ -172,6 +174,9 @@ class TargetTracker:
         snap:         是否启用低置信时的特征色漂移校正。
         snap_min:     反投影峰值达到该值才把框拉回目标。
         snap_search:  漂移校正的搜索半径倍数(相对当前框尺寸)。
+        motion:       是否启用运动能量追踪(目标与背景融合后的最后防线:
+                      帧差能量 + 方向门控,模拟人眼“按移动方向持续追踪”)。
+        motion_min:   运动证据的最低能量强度(相对背景噪声水平)。
     """
 
     SIG_BAND = 20       # 初始化时提取背景环的宽度(像素)
@@ -186,6 +191,8 @@ class TargetTracker:
         snap: bool = True,
         snap_min: float = 0.50,
         snap_search: float = 1.6,
+        motion: bool = True,
+        motion_min: float = 1.6,
     ) -> None:
         self.tracker_type = tracker_type
         self.conf_warn = float(conf_warn)
@@ -194,6 +201,8 @@ class TargetTracker:
         self.snap_enabled = bool(snap)
         self.snap_min = float(snap_min)
         self.snap_search = float(snap_search)
+        self.motion_enabled = bool(motion)
+        self.motion_min = float(motion_min)
 
         self._tracker = None
         self._resolved_name: str = ""
@@ -201,6 +210,10 @@ class TargetTracker:
         self._sig_scale: float = 0.0                  # 初始帧的特征色占比
         self._sig_reliable: bool = False              # 特征色是否足以驱动丢失判定
         self._miss = 0                                # 疑似丢失连击计数
+        self._motion = MotionTracker()
+        self._csrt_diverge = 0                        # CSRT 框与修正框持续背离帧数
+        self._csrt_fail = 0                           # CSRT 连续失败帧数
+        self._motion_miss = 0                         # 连续无运动证据帧数
         self.last_result = TrackResult(TrackStatus.IDLE)
 
     # ------------------------------------------------------------------ 属性
@@ -231,6 +244,12 @@ class TargetTracker:
         self._tracker = tracker
         self._resolved_name = resolved
         self._miss = 0
+        self._csrt_diverge = 0
+        self._csrt_fail = 0
+        self._motion.reset()
+        self._motion_miss = 0
+        cx, cy = self._center_of(clean)
+        self._motion.last_center = np.array([float(cx), float(cy)])
         self.last_result = TrackResult(
             TrackStatus.TRACKING, clean, self._center_of(clean), 1.0, note="init"
         )
@@ -244,42 +263,55 @@ class TargetTracker:
         self._sig_scale = 0.0
         self._sig_reliable = False
         self._miss = 0
+        self._motion.reset()
+        self._motion_miss = 0
+        self._csrt_diverge = 0
+        self._csrt_fail = 0
         self.last_result = TrackResult(TrackStatus.IDLE)
 
     # ------------------------------------------------------------------ 逐帧更新
 
     def update(self, frame: np.ndarray) -> TrackResult:
-        """推进一帧:返回追踪状态、边界框、中心坐标与置信度。"""
+        """推进一帧:返回追踪状态、边界框、中心坐标与置信度。
+
+        低置信时的处理顺序:
+        1. 特征色反投影 snap(外观还剩一点信息时,把框拉回目标);
+        2. 运动能量定位(外观完全失效时,按“预测位置 + 移动方向”跟着走);
+        3. CSRT 持续背离/失败时,用当前估计位置重建 CSRT(保留颜色模型)。
+        """
         if self._tracker is None:
             return TrackResult(TrackStatus.IDLE)
         if frame is None or getattr(frame, "size", 0) == 0:
             raise ValueError("update() 收到空帧")
 
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        csrt_ok = True
         try:
             res = self._tracker.update(frame)
         except cv2.error:
             res = (False, None)
 
         # 兼容不同版本:update() 可能返回 (ok, bbox) 元组,也可能只返回 bbox。
+        raw_bbox = None
         if isinstance(res, (tuple, list)) and len(res) >= 2:
-            ok, raw_bbox = bool(res[0]), res[1]
-        else:
-            ok, raw_bbox = True, res
-
-        if not ok:
-            return self._mark_lost("tracker 失败")
+            csrt_ok, raw_bbox = bool(res[0]), res[1]
+        elif res is not None:
+            raw_bbox = res
 
         clean = _sanitize_bbox(raw_bbox, frame.shape)
         if clean is None:
-            return self._mark_lost("bbox 非法")
+            # CSRT 失败或框非法:退回上一有效框继续运动追踪,而不是立刻判丢失。
+            csrt_ok = False
+            clean = self.last_result.bbox
+            if clean is None:
+                return self._mark_lost("tracker 失败且无历史框")
+            clean = _sanitize_bbox(clean, frame.shape)
 
         conf = self._signature_conf(frame, clean)
-
-        # 低置信 → 特征色反投影漂移校正,把框拉回目标。
-        # 轻度低置信:多半是形变/透明度波动,只允许小步校正,防止跳到
-        # 相似干扰物上;深度低置信(疑似位置漂移)才允许拉回到整个
-        # 搜索窗内的峰值处。
         note = ""
+
+        # 1) 特征色反投影漂移校正。
         if self.snap_enabled and self._sig_reliable and conf < self.conf_warn:
             deep = conf < self.conf_lost
             snapped = self._try_snap(
@@ -291,14 +323,86 @@ class TargetTracker:
                 conf = self._signature_conf(frame, clean)
                 note = "snap"
 
-        # 丢失判定:tracker 正常但特征色长期消失 → 框已不在目标上。
-        if self._sig_reliable and conf < self.conf_lost:
-            self._miss += 1
+        # 2) 运动能量定位:外观失效时的最后防线。
+        #    颜色模型不可靠(如白色/灰色目标)时,运动定位每帧都运行,
+        #    作为 CSRT 的独立验证器:一旦两者长期分歧就纠正并重锚定。
+        #    连续多帧无运动证据时扩大到全图重捕获(要求更强证据)。
+        motion_hit = False
+        motion_active = (
+            conf < self.conf_warn
+            or not csrt_ok
+            or not self._sig_reliable
+        )
+        if self.motion_enabled and motion_active:
+            reacquire = self._motion_miss >= 5
+            pred = None
+            gate = 40.0
+            if not reacquire and self._motion.last_center is not None:
+                speed = float(np.linalg.norm(self._motion.vel))
+                pred = (
+                    self._motion.last_center[0] + self._motion.vel[0],
+                    self._motion.last_center[1] + self._motion.vel[1],
+                )
+                gate = max(28.0, 2.5 * speed + 0.9 * max(clean[2], clean[3]))
+            size_hint = max(clean[2], clean[3]) / 2.0
+            need = self.motion_min * 1.7 if reacquire else self.motion_min
+            loc, strength = self._motion.locate(gray, pred, gate, size_hint)
+            if loc is not None and strength >= need:
+                x, y, w, h = clean
+                cx_cur, cy_cur = x + w / 2.0, y + h / 2.0
+                # 偏差明显时才纠正,避免与 CSRT 正常结果互相微扰。
+                far = np.hypot(loc[0] - cx_cur, loc[1] - cy_cur) > 0.45 * max(w, h)
+                if not csrt_ok or far:
+                    shifted = _sanitize_bbox(
+                        (loc[0] - w / 2, loc[1] - h / 2, w, h), frame.shape
+                    )
+                    if shifted is not None:
+                        clean = shifted
+                        motion_hit = True
+                        motion_conf = min(0.9, 0.35 + 0.15 * strength)
+                        if self._sig_reliable:
+                            conf = max(conf, motion_conf)
+                        note = "motion" if not note else note + "+motion"
+                        # 颜色模型不可靠时运动是主依据:立即把 CSRT 锚定到
+                        # 目标当前位置,防止被拒帧回退到 CSRT 的旧位置。
+                        if not self._sig_reliable:
+                            self._re_anchor(frame, clean)
+                else:
+                    motion_hit = True  # 运动证据与 CSRT 一致:目标在场
+                self._motion_miss = 0
+            else:
+                self._motion_miss += 1
+
+        # 3) CSRT 与最终估计长期背离 / 连续失败时重建 CSRT(保留颜色模型)。
+        if csrt_ok:
+            csrt_c = self._center_of(_sanitize_bbox(raw_bbox, frame.shape) or clean)
+            if np.linalg.norm(np.subtract(csrt_c, self._center_of(clean))) > 1.3 * max(
+                clean[2], clean[3]
+            ):
+                self._csrt_diverge += 1
+            else:
+                self._csrt_diverge = 0
+            self._csrt_fail = 0
         else:
+            self._csrt_fail += 1
+        if (self._csrt_diverge >= 8 or self._csrt_fail >= 5) and self.last_result.bbox is not None:
+            self._re_anchor(frame, clean)
+            self._csrt_diverge = 0
+            self._csrt_fail = 0
+
+        # 丢失判定:无外观证据且无运动证据,连续多帧 → 判定 LOST。
+        # 颜色模型不可靠时,以「CSRT 正常或存在运动证据」作为在场依据。
+        if self._sig_reliable:
+            present = motion_hit or conf >= self.conf_lost
+        else:
+            present = motion_hit or csrt_ok
+        if present:
             self._miss = 0
+        else:
+            self._miss += 1
 
         if self._miss >= self.lost_streak:
-            return self._mark_lost(f"特征色占比连续偏低({self._miss}帧)")
+            return self._mark_lost(f"置信度连续偏低({self._miss}帧)")
         if conf < self.conf_warn:
             status = TrackStatus.LOW_CONF
         else:
@@ -307,6 +411,14 @@ class TargetTracker:
         result = TrackResult(status, clean, self._center_of(clean), conf, note)
         self.last_result = result
         return result
+
+    def _re_anchor(self, frame: np.ndarray, bbox: BBox) -> None:
+        """用当前估计位置重建底层 CSRT(保留特征色模型,不清空外观记忆)。"""
+        tracker, resolved = create_tracker(self.tracker_type)
+        tracker.init(frame, bbox)
+        self._tracker = tracker
+        self._resolved_name = resolved
+        print(f"[重锚定] tracker 已在 {bbox} 处重建({resolved}),颜色模型保持不变")
 
     # ------------------------------------------------------------------ 特征色模型
 
@@ -358,12 +470,27 @@ class TargetTracker:
         self._signature = hist / peak if peak > 0 else None
 
         self._sig_scale = self._raw_signature_score(frame, bbox)
+        # 判别力检验:签名在「背景环」上的命中率应明显低于 ROI。
+        # 若背景环几乎同样命中(如白色目标,签名其实来自背景色),
+        # 说明签名只是背景噪声,标记为不可靠。
+        band_x, band_y = x0, y0
+        band_w, band_h = x1 - x0, y1 - y0
+        band_score = 0.0
+        if self._signature is not None:
+            band_bbox = _sanitize_bbox((band_x, band_y, band_w, band_h), frame.shape)
+            if band_bbox is not None:
+                band_score = self._raw_signature_score(frame, band_bbox)
+        discriminative = (
+            self._sig_scale <= 0 or band_score / max(self._sig_scale, 1e-3) <= 0.6
+        )
         # 特征色占比过低 → 颜色信号不可靠(目标不比背景饱和/框内全是背景色)
-        self._sig_reliable = self._sig_scale >= 0.08 and self._signature is not None
+        self._sig_reliable = (
+            self._sig_scale >= 0.08 and self._signature is not None and discriminative
+        )
         if not self._sig_reliable:
             print(
-                "[提示] 目标外观与背景差异较小,置信度仅作参考;"
-                "丢失判定退化为 tracker 自身返回值,请留意画面人工确认。"
+                "[提示] 目标颜色与背景难以区分,置信度仅作参考;"
+                "将启用运动能量追踪作为主要依据,请留意画面人工确认。"
             )
 
     def _raw_signature_score(self, frame: np.ndarray, bbox: BBox) -> float:

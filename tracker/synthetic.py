@@ -205,3 +205,179 @@ class SyntheticScene:
         w = max(2, min(w, self.w - x))
         h = max(2, min(h, self.h - y))
         return (x, y, w, h)
+
+
+class FadeRectScene:
+    """「白色矩形渐隐」场景:复刻用户描述的最难情形。
+
+    - 开头约 2 秒:一个白色矩形在画面中央旋转(完全可见,适合框选初始化);
+    - 随后 2 秒:矩形逐渐透明,与水纹背景融合,同时开始漂移;
+    - 之后:近乎不可见(alpha 0.05~0.15,带轻微闪烁),随机游走;
+      唯一可辨的线索是跟随目标一起移动、轻微闪烁的水波纹光晕,
+      背景里还烘焙了几组「静态」波纹作为干扰。
+    """
+
+    RECT_W, RECT_H = 38, 26          # 矩形尺寸
+    FADE_START = 55                  # 开始变透明的帧
+    FADE_END = 115                   # 完全融入背景的帧
+    RIPPLE_RADII = (34, 50, 66)      # 目标波纹光晕半径
+
+    def __init__(
+        self,
+        size: Tuple[int, int] = (640, 360),
+        seed: int = 3,
+        n_static_ripples: int = 3,
+    ) -> None:
+        self.w, self.h = size
+        self.rng = np.random.default_rng(seed)
+        self.t = 0
+
+        self.pos = np.array([self.w * 0.5, self.h * 0.5])
+        self.vel = np.array([1.2, -0.8])
+        self.angle = 0.0
+
+        self.background = self._make_background()
+        # 静态干扰波纹:位置固定,只有目标波纹才会动
+        self.static_ripples = [
+            (self.rng.uniform(60, self.w - 60), self.rng.uniform(50, self.h - 50),
+             self.rng.uniform(24, 40))
+            for _ in range(n_static_ripples)
+        ]
+
+        self.visible = True  # 目标是否仍明显可见(供测试区分阶段)
+
+    # ------------------------------------------------------------------ 公开接口
+
+    def step(self) -> Tuple[np.ndarray, BBox]:
+        """推进一帧,返回 (frame, 目标外接框)。"""
+        self.t += 1
+        t = self.t
+
+        # 透明度曲线:可见 → 线性渐隐 → 近乎不可见并轻微闪烁
+        if t <= self.FADE_START:
+            alpha = 0.95
+            self.visible = True
+        elif t <= self.FADE_END:
+            k = (t - self.FADE_START) / (self.FADE_END - self.FADE_START)
+            alpha = 0.95 - 0.85 * k
+            self.visible = alpha > 0.45
+        else:
+            alpha = 0.10 + 0.05 * (1.0 + np.sin(t * 0.45))  # 0.10 ~ 0.20
+            self.visible = False
+
+        # 运动:先慢速漂移,渐隐后随机游走(阻尼 + 扰动,撞墙反弹)
+        if t <= self.FADE_START:
+            self.vel *= 0.98
+        else:
+            self.vel += self.rng.normal(0.0, 0.22, 2)
+            speed = np.linalg.norm(self.vel)
+            cap = 2.8
+            if speed > cap:
+                self.vel *= cap / speed
+            self.vel *= 0.97
+        self.pos += self.vel
+        for i, limit in enumerate((self.w, self.h)):
+            m = 40
+            if self.pos[i] < m:
+                self.pos[i] = m
+                self.vel[i] = abs(self.vel[i])
+            elif self.pos[i] > limit - m:
+                self.pos[i] = limit - m
+                self.vel[i] = -abs(self.vel[i])
+
+        # 旋转:可见阶段稳定旋转,渐隐后放慢
+        self.angle += 2.4 if self.visible else 0.9
+
+        frame = self.background.copy()
+
+        # 目标波纹光晕:随目标移动、半径缓慢脉动、亮度闪烁 —— 关键线索
+        for k, r0 in enumerate(self.RIPPLE_RADII):
+            r = r0 + 4.0 * np.sin(t * 0.5 + k * 1.3)
+            a = 0.10 + 0.05 * np.sin(t * 0.9 + k)
+            self._blend_ring(frame, self.pos, r, a, color=(215, 235, 245))
+
+        # 静态干扰波纹(烘焙在背景上,不随目标移动)
+        for sx, sy, sr in self.static_ripples:
+            cv2.circle(frame, (int(sx), int(sy)), int(sr), (205, 225, 235), 1, cv2.LINE_AA)
+            cv2.circle(frame, (int(sx), int(sy)), int(sr * 0.7), (200, 220, 232), 1, cv2.LINE_AA)
+
+        # 半透明白色矩形
+        self._blend_rect(frame, alpha)
+
+        return frame, self._gt_bbox()
+
+    # ------------------------------------------------------------------ 内部实现
+
+    def _make_background(self) -> np.ndarray:
+        """水纹背景:蓝绿渐变 + 干涉波纹 + 深浅斑块 + 噪声(全程静止)。"""
+        gx, gy = np.meshgrid(np.linspace(0, 1, self.w), np.linspace(0, 1, self.h))
+        xs = np.arange(self.w, dtype=np.float32)
+        ys = np.arange(self.h, dtype=np.float32)
+        xx, yy = np.meshgrid(xs, ys)
+        ripple = (
+            7.0 * np.sin(xx / 23.0 + yy / 17.0)
+            + 5.0 * np.sin(xx / 41.0 - yy / 29.0 + 1.2)
+            + 4.0 * np.sin((xx + yy) / 61.0)
+        )
+        base = np.stack(
+            [
+                92 + 26 * gx + ripple * 0.9,
+                118 + 30 * gy + ripple,
+                128 + 24 * (1 - gx * 0.4) + ripple * 0.8,
+            ],
+            axis=-1,
+        ).clip(0, 255).astype(np.uint8)
+
+        for _ in range(26):  # 深浅斑块,模拟水下明暗
+            x, y = self.rng.integers(0, self.w), self.rng.integers(0, self.h)
+            w2, h2 = self.rng.integers(30, 110, 2)
+            shade = int(self.rng.integers(-30, 26))
+            roi = base[
+                max(0, int(y)) : min(self.h, int(y + h2)),
+                max(0, int(x)) : min(self.w, int(x + w2)),
+            ]
+            if roi.size:
+                base[
+                    max(0, int(y)) : min(self.h, int(y + h2)),
+                    max(0, int(x)) : min(self.w, int(x + w2)),
+                ] = np.clip(roi.astype(np.int16) + shade, 0, 255).astype(np.uint8)
+
+        noise = self.rng.integers(-6, 7, (self.h, self.w, 1), dtype=np.int16)
+        return np.clip(base.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+
+    def _blend_rect(self, frame: np.ndarray, alpha: float) -> None:
+        if alpha <= 0.01:
+            return
+        overlay = frame.copy()
+        pts = cv2.boxPoints(
+            (
+                (float(self.pos[0]), float(self.pos[1])),
+                (self.RECT_W, self.RECT_H),
+                float(np.degrees(self.angle)),
+            )
+        ).astype(np.int32)
+        cv2.fillPoly(overlay, [pts], (245, 248, 252))
+        cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0, dst=frame)
+
+    def _blend_ring(self, frame, pos, radius, alpha, color) -> None:
+        if alpha <= 0.01:
+            return
+        overlay = frame.copy()
+        cv2.circle(overlay, (int(pos[0]), int(pos[1])), int(radius), color, 2, cv2.LINE_AA)
+        cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0, dst=frame)
+
+    def _gt_bbox(self) -> BBox:
+        pts = cv2.boxPoints(
+            (
+                (float(self.pos[0]), float(self.pos[1])),
+                (self.RECT_W, self.RECT_H),
+                float(np.degrees(self.angle)),
+            )
+        )
+        x0, y0 = pts.min(axis=0)
+        x1, y1 = pts.max(axis=0)
+        x = max(0, int(round(x0)))
+        y = max(0, int(round(y0)))
+        w = max(2, min(int(round(x1 - x0)), self.w - x))
+        h = max(2, min(int(round(y1 - y0)), self.h - y))
+        return (x, y, w, h)
