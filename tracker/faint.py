@@ -177,13 +177,14 @@ class FaintBrightTracker:
         if strength < floor:
             self.since_accept += 1
             return None, 0.0
-        if self.since_accept > 3:
-            # 冷启动不允许远距离抢锁:候选必须贴近预测点(链断期间的
-            # 长距离恢复由 LOST 后 coast 门扩大来承担)。
-            d_pred = float(np.hypot(pos[0] - px, pos[1] - py))
-            if d_pred > gate + self._size / 2:
-                self.since_accept += 1
-                return None, 0.0
+        # 预测邻域约束(所有接受,含连续追踪):候选必须落在预测点
+        # gate + 半个目标尺寸内。连续追踪时这是把 faint 约束在 CSRT/
+        # motion 邻域的缰绳;LOST 后 coast 门随时间扩大,长距离恢复
+        # 仍然允许 —— 远处的亮云/UI 因此永远够不着候选。
+        d_pred = float(np.hypot(pos[0] - px, pos[1] - py))
+        if d_pred > gate + self._size / 2:
+            self.since_accept += 1
+            return None, 0.0
 
         if self.last_pos is not None:
             step = np.array(pos) - np.array(self.last_pos)
@@ -193,11 +194,18 @@ class FaintBrightTracker:
                 self.since_accept += 1
                 return None, 0.0
             if self.since_accept <= 3:
-                # 连续追踪中突然大跳:可能是虚警抢锁;但联合证据极强
-                # (z≥6 且强度足)时豁免 —— 真目标也可能突然加速。
+                # 连续追踪中突然大跳:可能是虚警抢锁(如「开始」闪现后的
+                # 天空亮云);但联合证据极强(z≥6 且强度足)时豁免 ——
+                # 真目标也可能突然加速。豁免的跳变距离同样封顶:
+                # 加速的真目标仍在预测邻域量级,绝不可能一步数百像素。
                 speed = float(np.linalg.norm(self.vel))
                 limit = max(2.5 * speed + 24.0, 48.0)
-                strong = peak >= 6.0 and strength >= 0.35
+                strong_cap = max(1.5 * gate, 120.0)
+                strong = (
+                    peak >= 6.0
+                    and strength >= 0.35
+                    and d <= strong_cap
+                )
                 if d > limit and not strong:
                     self.since_accept += 1
                     return None, 0.0

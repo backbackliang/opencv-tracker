@@ -241,6 +241,69 @@ class TargetTracker:
 
     # ------------------------------------------------------------------ 初始化
 
+    def _tighten_to_bright_blob(self, frame: np.ndarray, bbox):
+        """初始化 ROI 收紧:框内存在显著亮块(即目标本身)时,把 ROI
+        收紧到最大亮块的外接框。
+
+        手动框选常把目标附近的倒计时数字/高亮 UI 一起圈进来,CSRT 模板
+        随之被带偏。中性亮块(白度 min(B,G,R))显著亮于 ROI 边缘且面积
+        占比 ≥25% 时才收紧;彩色目标或框太松(亮块不占主导)一律不动。
+        """
+        x, y, w, h = (float(v) for v in bbox)
+        H, W = frame.shape[:2]
+        x0, y0 = max(0, int(round(x))), max(0, int(round(y)))
+        x1, y1 = min(W, int(round(x + w))), min(H, int(round(y + h)))
+        if x1 - x0 < 24 or y1 - y0 < 24:
+            return bbox
+        b, g, r = frame[:, :, 0], frame[:, :, 1], frame[:, :, 2]
+        wht = np.minimum(np.minimum(b, g), r).astype(np.float32)
+        roi = wht[y0:y1, x0:x1]
+        edge = 4
+        border = np.concatenate(
+            [roi[:edge].ravel(), roi[-edge:].ravel(),
+             roi[:, :edge].ravel(), roi[:, -edge:].ravel()]
+        )
+        lift = float(np.percentile(roi, 90)) - float(np.median(border))
+        if lift < 8.0:
+            return bbox
+        thr = float(np.median(border)) + max(0.75 * lift, 10.0)
+        mask = (roi >= thr).astype(np.uint8)
+        # 开运算切断与目标连通的细亮脉络(水纹高光),只留实心亮块
+        mask = cv2.morphologyEx(
+            mask, cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)),
+        )
+        n, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        if n <= 1:
+            return bbox
+        best = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        area = int(stats[best, cv2.CC_STAT_AREA])
+        if area < 0.25 * (x1 - x0) * (y1 - y0):
+            return bbox
+        bw, bh = int(stats[best, cv2.CC_STAT_WIDTH]), int(stats[best, cv2.CC_STAT_HEIGHT])
+        if bw < 16 or bh < 16:
+            return bbox
+        bx, by = int(stats[best, cv2.CC_STAT_LEFT]), int(stats[best, cv2.CC_STAT_TOP])
+        # 收紧 = 亮块外接框 + 5% 余量;只缩不涨,且不越出原框
+        ncx, ncy = x0 + bx + bw / 2, y0 + by + bh / 2
+        nbw = min(float(w), bw * 1.06)
+        nbh = min(float(h), bh * 1.06)
+        nbw, nbh = max(nbw, 20.0), max(nbh, 20.0)
+        new_box = (ncx - nbw / 2, ncy - nbh / 2, nbw, nbh)
+        fixed = _sanitize_bbox(new_box, frame.shape)
+        if fixed is None:
+            return bbox
+        # 变化太小则保持原框(避免无谓打印)
+        fcx, fcy = fixed[0] + fixed[2] / 2, fixed[1] + fixed[3] / 2
+        if (abs(fcx - (x + w / 2)) < 0.05 * w and abs(fcy - (y + h / 2)) < 0.05 * h
+                and abs(fixed[2] - w) < 0.06 * w and abs(fixed[3] - h) < 0.06 * h):
+            return bbox
+        print(
+            f"[初始化] ROI 收紧到高亮目标: ({x:.0f},{y:.0f},{w:.0f},{h:.0f}) "
+            f"→ ({fixed[0]:.0f},{fixed[1]:.0f},{fixed[2]:.0f},{fixed[3]:.0f})"
+        )
+        return fixed
+
     def init(self, frame: np.ndarray, bbox) -> bool:
         """用鼠标框选的 ROI 初始化(或重新初始化)追踪器。"""
         if frame is None or getattr(frame, "size", 0) == 0:
@@ -248,6 +311,7 @@ class TargetTracker:
         clean = _sanitize_bbox(bbox, frame.shape)
         if clean is None:
             return False
+        clean = self._tighten_to_bright_blob(frame, clean)
 
         tracker, resolved = create_tracker(self.tracker_type)
         tracker.init(frame, clean)
