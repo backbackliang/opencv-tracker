@@ -38,6 +38,7 @@ from typing import Optional, Tuple
 import cv2
 import numpy as np
 
+from .faint import FaintBrightTracker
 from .motion import MotionTracker
 
 BBox = Tuple[int, int, int, int]
@@ -211,9 +212,18 @@ class TargetTracker:
         self._sig_reliable: bool = False              # 特征色是否足以驱动丢失判定
         self._miss = 0                                # 疑似丢失连击计数
         self._motion = MotionTracker()
+        self._faint = FaintBrightTracker()
         self._csrt_diverge = 0                        # CSRT 框与修正框持续背离帧数
         self._csrt_fail = 0                           # CSRT 连续失败帧数
         self._motion_miss = 0                         # 连续无运动证据帧数
+        self._faint_streak = 0                        # faint 通道持续纠正帧数
+        self._faint_pos = None                        # faint 通道最近定位
+        self._faint_miss = 0                          # faint 通道连续失效帧数
+        self._since_reanchor = 0                      # 距上次重锚定的帧数
+        self._frames_since_motion = 99                # 距 motion 通道上次运行的帧数
+        self._ever_lost = False                       # 本次追踪是否已宣告过 LOST
+        self._faint_last_good = None                  # faint 通道最后有效定位
+        self._log_cooldown = 0                        # 重锚定日志打印冷却
         self.last_result = TrackResult(TrackStatus.IDLE)
 
     # ------------------------------------------------------------------ 属性
@@ -241,6 +251,7 @@ class TargetTracker:
         tracker.init(frame, clean)
 
         self._build_signature(frame, clean)
+        self._faint.init(frame, clean)
         self._tracker = tracker
         self._resolved_name = resolved
         self._miss = 0
@@ -248,6 +259,10 @@ class TargetTracker:
         self._csrt_fail = 0
         self._motion.reset()
         self._motion_miss = 0
+        self._faint_streak = 0
+        self._faint_miss = 0
+        self._since_reanchor = 0
+        self._frames_since_motion = 99
         cx, cy = self._center_of(clean)
         self._motion.last_center = np.array([float(cx), float(cy)])
         self.last_result = TrackResult(
@@ -264,6 +279,14 @@ class TargetTracker:
         self._sig_reliable = False
         self._miss = 0
         self._motion.reset()
+        self._faint.reset()
+        self._faint_streak = 0
+        self._faint_pos = None
+        self._faint_miss = 0
+        self._since_reanchor = 0
+        self._frames_since_motion = 99
+        self._ever_lost = False
+        self._faint_last_good = None
         self._motion_miss = 0
         self._csrt_diverge = 0
         self._csrt_fail = 0
@@ -311,6 +334,67 @@ class TargetTracker:
         conf = self._signature_conf(frame, clean)
         note = ""
 
+        # 1.5) 微弱亮度抬升定位:白色/灰色目标渐隐时仍比背景「亮一点」,
+        #      抬升量与透明度成正比 —— 位置与置信度都可用它估计。
+        #      颜色签名不可靠且该通道在初始化时有足够信噪比时启用。
+        faint_hit = False
+        faint_active = not self._sig_reliable and self._faint.reliable
+        if faint_active:
+            fcx, fcy = self._center_of(clean)
+            # 门收紧到 1.2 倍目标尺寸:排除附近的高亮干扰(如倒计时数字)。
+            loc, strength = self._faint.locate(frame, (fcx, fcy), gate=1.2 * max(clean[2], clean[3]))
+            # 中断后重新进入需要更高门槛(CSRT 正常工作时 faint 无权抢回);
+            # 防止背景亮斑把一条本来很好的轨迹拽走。
+            needed = (
+                self._faint.min_strength
+                if self._faint_miss == 0
+                else self._faint.min_strength * 1.5
+            )
+            if self._ever_lost:
+                # 已宣告 LOST:只有目标几乎恢复可见(抬升接近初始)且
+                # 距最后有效位置不远(目标不会瞬移)才允许复活。
+                needed = max(needed, 0.9)
+            accept = loc is not None and needed <= strength <= 1.6
+            # 重进入(曾中断)时要求位置合理:距最后有效位置 ≤500px。
+            # 目标不会瞬移;远处的亮区(小地图/计时器等 UI)一律拒绝。
+            if accept and self._faint_miss > 0 and self._faint_last_good is not None:
+                accept = (
+                    np.hypot(loc[0] - self._faint_last_good[0],
+                             loc[1] - self._faint_last_good[1]) <= 500.0
+                )
+            if accept:
+                x, y, w, h = clean
+                faint_box = _sanitize_bbox((loc[0] - w / 2, loc[1] - h / 2, w, h), frame.shape)
+                if faint_box is not None:
+                    dev = np.hypot(loc[0] - (x + w / 2), loc[1] - (y + h / 2))
+                    if dev > 0.18 * max(w, h):
+                        clean = faint_box
+                        note = "faint" if not note else note + "+faint"
+                        self._faint_streak += 1
+                        # faint 可信且持续偏离 → CSRT 已漂移;低频重锚纠正
+                        if self._faint_streak >= 8 and self._since_reanchor >= 15:
+                            self._re_anchor(frame, clean)
+                            self._since_reanchor = 0
+                            self._faint_streak = 0
+                    else:
+                        self._faint_streak = 0
+                    # faint 是主要外观证据:置信度直接反映抬升强度
+                    conf = min(1.0, strength)
+                    faint_hit = True
+                    self._faint_pos = loc
+                    self._faint_last_good = (float(loc[0]), float(loc[1]))
+                    self._since_reanchor += 1
+                else:
+                    self._faint_pos = None
+                self._faint_miss = 0
+            else:
+                self._faint_pos = None
+                self._faint_miss += 1
+                self._since_reanchor += 1
+                if faint_active:
+                    # faint 是主证据却缺席 → 诚实降级置信度,提醒人工确认
+                    conf = min(conf, 0.35)
+
         # 1) 特征色反投影漂移校正。
         if self.snap_enabled and self._sig_reliable and conf < self.conf_warn:
             deep = conf < self.conf_lost
@@ -324,14 +408,20 @@ class TargetTracker:
                 note = "snap"
 
         # 2) 运动能量定位:外观失效时的最后防线。
-        #    颜色模型不可靠(如白色/灰色目标)时,运动定位每帧都运行,
-        #    作为 CSRT 的独立验证器:一旦两者长期分歧就纠正并重锚定。
+        #    faint 通道命中时完全让位(它此时是最准的外观证据,motion 的
+        #    噪声峰值反而会覆盖正确位置);faint 失效帧才介入。
         #    连续多帧无运动证据时扩大到全图重捕获(要求更强证据)。
         motion_hit = False
         motion_active = (
-            conf < self.conf_warn
+            (self._sig_reliable and conf < self.conf_warn)
             or not csrt_ok
-            or not self._sig_reliable
+            or (not self._sig_reliable and not self._faint.reliable)
+            or (
+                not self._sig_reliable
+                and self._faint.reliable
+                and self._faint_miss >= 1
+                and not faint_hit
+            )
         )
         if self.motion_enabled and motion_active:
             reacquire = self._motion_miss >= 5
@@ -344,6 +434,13 @@ class TargetTracker:
                     self._motion.last_center[1] + self._motion.vel[1],
                 )
                 gate = max(28.0, 2.5 * speed + 0.9 * max(clean[2], clean[3]))
+                # motion 久未运行时,其内部预测已过时:改用当前框中心
+                if self._frames_since_motion > 5:
+                    pred = (float(clean[0] + clean[2] / 2), float(clean[1] + clean[3] / 2))
+                    gate = max(28.0, 0.9 * max(clean[2], clean[3]))
+            elif not reacquire:
+                pred = (float(clean[0] + clean[2] / 2), float(clean[1] + clean[3] / 2))
+                gate = max(28.0, 0.9 * max(clean[2], clean[3]))
             size_hint = max(clean[2], clean[3]) / 2.0
             need = self.motion_min * 1.7 if reacquire else self.motion_min
             loc, strength = self._motion.locate(gray, pred, gate, size_hint)
@@ -372,6 +469,10 @@ class TargetTracker:
                 self._motion_miss = 0
             else:
                 self._motion_miss += 1
+        if motion_active:
+            self._frames_since_motion = 0
+        else:
+            self._frames_since_motion += 1
 
         # 3) CSRT 与最终估计长期背离 / 连续失败时重建 CSRT(保留颜色模型)。
         if csrt_ok:
@@ -391,9 +492,15 @@ class TargetTracker:
             self._csrt_fail = 0
 
         # 丢失判定:无外观证据且无运动证据,连续多帧 → 判定 LOST。
-        # 颜色模型不可靠时,以「CSRT 正常或存在运动证据」作为在场依据。
+        # 颜色模型不可靠时,依据「是否启用了 faint 通道」分别处理:
+        # - faint 可靠:以 faint/运动证据为在场依据(CSRT 在渐隐段不可信);
+        # - faint 不可靠:以「CSRT 正常或存在运动证据」为在场依据。
         if self._sig_reliable:
             present = motion_hit or conf >= self.conf_lost
+        elif faint_active:
+            present = (faint_hit or motion_hit) and not self._ever_lost
+            if self._ever_lost:
+                present = faint_hit
         else:
             present = motion_hit or csrt_ok
         if present:
@@ -418,7 +525,11 @@ class TargetTracker:
         tracker.init(frame, bbox)
         self._tracker = tracker
         self._resolved_name = resolved
-        print(f"[重锚定] tracker 已在 {bbox} 处重建({resolved}),颜色模型保持不变")
+        self._since_reanchor = 0
+        self._log_cooldown -= 1
+        if self._log_cooldown <= 0:
+            print(f"[重锚定] tracker 已在 {bbox} 处重建({resolved})")
+            self._log_cooldown = 40
 
     # ------------------------------------------------------------------ 特征色模型
 
@@ -580,6 +691,7 @@ class TargetTracker:
 
     def _mark_lost(self, reason: str) -> TrackResult:
         self._miss += 1
+        self._ever_lost = True
         result = TrackResult(
             TrackStatus.LOST, self.last_result.bbox, self.last_result.center, 0.0, reason
         )
