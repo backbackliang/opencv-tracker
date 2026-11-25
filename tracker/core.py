@@ -221,7 +221,9 @@ class TargetTracker:
         self._faint_miss = 0                          # faint 通道连续失效帧数
         self._since_reanchor = 0                      # 距上次重锚定的帧数
         self._frames_since_motion = 99                # 距 motion 通道上次运行的帧数
+        self._since_motion_hit = 99                   # 距 motion 通道上次命中目标的帧数
         self._ever_lost = False                       # 本次追踪是否已宣告过 LOST
+        self._since_lost = 0                          # 宣告 LOST 后经过的帧数
         self._faint_last_good = None                  # faint 通道最后有效定位
         self._log_cooldown = 0                        # 重锚定日志打印冷却
         self.last_result = TrackResult(TrackStatus.IDLE)
@@ -285,7 +287,9 @@ class TargetTracker:
         self._faint_miss = 0
         self._since_reanchor = 0
         self._frames_since_motion = 99
+        self._since_motion_hit = 99
         self._ever_lost = False
+        self._since_lost = 0
         self._faint_last_good = None
         self._motion_miss = 0
         self._csrt_diverge = 0
@@ -308,6 +312,8 @@ class TargetTracker:
             raise ValueError("update() 收到空帧")
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        # 运动能量图每帧更新一次:faint 的「平静洞」与 motion 共用
+        energy = self._motion.process(gray)
 
         csrt_ok = True
         try:
@@ -340,29 +346,34 @@ class TargetTracker:
         faint_hit = False
         faint_active = not self._sig_reliable and self._faint.reliable
         if faint_active:
-            fcx, fcy = self._center_of(clean)
-            # 门收紧到 1.2 倍目标尺寸:排除附近的高亮干扰(如倒计时数字)。
-            loc, strength = self._faint.locate(frame, (fcx, fcy), gate=1.2 * max(clean[2], clean[3]))
-            # 中断后重新进入需要更高门槛(CSRT 正常工作时 faint 无权抢回);
-            # 防止背景亮斑把一条本来很好的轨迹拽走。
-            needed = (
-                self._faint.min_strength
-                if self._faint_miss == 0
-                else self._faint.min_strength * 1.5
-            )
             if self._ever_lost:
-                # 已宣告 LOST:只有目标几乎恢复可见(抬升接近初始)且
-                # 距最后有效位置不远(目标不会瞬移)才允许复活。
-                needed = max(needed, 0.9)
-            accept = loc is not None and needed <= strength <= 1.6
-            # 重进入(曾中断)时要求位置合理:距最后有效位置 ≤500px。
-            # 目标不会瞬移;远处的亮区(小地图/计时器等 UI)一律拒绝。
-            if accept and self._faint_miss > 0 and self._faint_last_good is not None:
-                accept = (
-                    np.hypot(loc[0] - self._faint_last_good[0],
-                             loc[1] - self._faint_last_good[1]) <= 500.0
-                )
-            if accept:
+                # LOST 后进入幽灵滑行:按速度惯性外推可能位置,门随时间
+                # 扩大,联合证据一旦重新出现立即恢复锁定。
+                self._since_lost += 1
+                coast = self._faint.coast_center()
+                if coast is not None:
+                    fcx, fcy = coast
+                else:
+                    fcx, fcy = self._center_of(clean)
+                gate = min(420.0, 1.2 * max(clean[2], clean[3]) + 10.0 * self._since_lost)
+            else:
+                self._since_lost = 0
+                fcx, fcy = self._center_of(clean)
+                # 门收紧到 1.2 倍目标尺寸:排除附近的高亮干扰(如倒计时数字)。
+                gate = 1.2 * max(clean[2], clean[3])
+            # 冷启动候选至少要有初始强度的 0.35;LOST 后的复活更严:
+            # 必须近乎恢复可见(≥0.9),防止片尾 UI 亮字/背景亮斑抢锁。
+            alive_floor = 0.0
+            if self._ever_lost:
+                cold_floor = 0.9
+                alive_floor = 0.9
+            else:
+                cold_floor = 0.35
+            loc, fconf = self._faint.locate(
+                frame, energy, (fcx, fcy), gate,
+                cold_min_strength=cold_floor, alive_min_strength=alive_floor,
+            )
+            if loc is not None:
                 x, y, w, h = clean
                 faint_box = _sanitize_bbox((loc[0] - w / 2, loc[1] - h / 2, w, h), frame.shape)
                 if faint_box is not None:
@@ -378,12 +389,15 @@ class TargetTracker:
                             self._faint_streak = 0
                     else:
                         self._faint_streak = 0
-                    # faint 是主要外观证据:置信度直接反映抬升强度
-                    conf = min(1.0, strength)
+                    # faint 是主要外观证据:置信度直接反映联合证据强度
+                    conf = fconf
                     faint_hit = True
                     self._faint_pos = loc
-                    self._faint_last_good = (float(loc[0]), float(loc[1]))
                     self._since_reanchor += 1
+                    if self._ever_lost:
+                        self._ever_lost = False
+                        self._since_lost = 0
+                        print("[重新捕获] 渐隐目标联合证据恢复,继续追踪")
                 else:
                     self._faint_pos = None
                 self._faint_miss = 0
@@ -391,9 +405,8 @@ class TargetTracker:
                 self._faint_pos = None
                 self._faint_miss += 1
                 self._since_reanchor += 1
-                if faint_active:
-                    # faint 是主证据却缺席 → 诚实降级置信度,提醒人工确认
-                    conf = min(conf, 0.35)
+                # faint 是主证据却缺席 → 诚实降级置信度,提醒人工确认
+                conf = min(conf, 0.35)
 
         # 1) 特征色反投影漂移校正。
         if self.snap_enabled and self._sig_reliable and conf < self.conf_warn:
@@ -456,6 +469,7 @@ class TargetTracker:
                     if shifted is not None:
                         clean = shifted
                         motion_hit = True
+                        self._since_motion_hit = 0
                         motion_conf = min(0.9, 0.35 + 0.15 * strength)
                         if self._sig_reliable:
                             conf = max(conf, motion_conf)
@@ -466,6 +480,7 @@ class TargetTracker:
                             self._re_anchor(frame, clean)
                 else:
                     motion_hit = True  # 运动证据与 CSRT 一致:目标在场
+                    self._since_motion_hit = 0
                 self._motion_miss = 0
             else:
                 self._motion_miss += 1
@@ -473,6 +488,7 @@ class TargetTracker:
             self._frames_since_motion = 0
         else:
             self._frames_since_motion += 1
+        self._since_motion_hit += 1
 
         # 3) CSRT 与最终估计长期背离 / 连续失败时重建 CSRT(保留颜色模型)。
         if csrt_ok:

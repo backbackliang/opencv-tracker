@@ -53,6 +53,7 @@ class MotionTracker:
 
         self._prev: Optional[np.ndarray] = None       # 上一帧灰度(已平滑)
         self._trail: Optional[np.ndarray] = None      # 衰减残影能量图
+        self.energy: Optional[np.ndarray] = None      # process() 缓存的能量图
         self._history: deque = deque(maxlen=4)        # 最近几帧灰度,用于多基线帧差
         self.vel = np.zeros(2)                        # 速度估计 (vx, vy)
         self.last_center: Optional[np.ndarray] = None # 上次报告的目标中心
@@ -66,27 +67,23 @@ class MotionTracker:
         self.vel = np.zeros(2)
         self.last_center = None
         self.strength = 0.0
+        self.energy = None
         self.frames = 0
 
     # ------------------------------------------------------------------ 主流程
 
-    def locate(
-        self,
-        gray: np.ndarray,
-        pred_center: Optional[Vec2],
-        gate: float,
-        size_hint: float = 30.0,
-    ) -> Tuple[Optional[Tuple[int, int]], float]:
-        """在预测点附近 gate 半径内找运动质心。
+    def process(self, gray: np.ndarray) -> Optional[np.ndarray]:
+        """推进一帧内部状态,返回本帧运动能量图(首帧返回 None)。
 
-        返回 (center|None, strength):center 为质心像素坐标,strength 是
-        能量强度(背景噪声水平归一后,>1 视为有效运动证据)。
+        能量图 = 多时间基线帧差(1/2/3 帧)最大值 + 衰减残影,
+        并做了全局运动补偿。faint 通道的「平静洞」检测也依赖此图。
         """
         smooth = cv2.GaussianBlur(gray, (self.blur, self.blur), 0)
         if self._prev is None or self._prev.shape != smooth.shape:
             self._prev = smooth
             self._history.append(smooth)
-            return None, 0.0
+            self.energy = None
+            return None
 
         # 全局运动补偿(轻微整体漂移/抖动)
         dx = dy = 0.0
@@ -127,6 +124,25 @@ class MotionTracker:
         else:
             self._trail = np.maximum(self._trail * self.trail_decay, diff)
         energy = diff.astype(np.float32) + self.trail_weight * self._trail
+        self.energy = energy
+        return energy
+
+    def locate(
+        self,
+        gray: np.ndarray,
+        pred_center: Optional[Vec2],
+        gate: float,
+        size_hint: float = 30.0,
+    ) -> Tuple[Optional[Tuple[int, int]], float]:
+        """在预测点附近 gate 半径内找运动质心。
+
+        返回 (center|None, strength):center 为质心像素坐标,strength 是
+        能量强度(背景噪声水平归一后,>1 视为有效运动证据)。
+        依赖先调用 process() 得到缓存能量图。
+        """
+        energy = self.energy
+        if energy is None:
+            return None, 0.0
 
         H, W = energy.shape
         # 搜索门:预测点附近的圆形区域;没有预测时全图(冷启动)。
